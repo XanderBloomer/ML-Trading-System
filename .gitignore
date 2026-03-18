@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environments
+.venv
+venv/
+.env
+
+# Data (never commit raw data)
+data/
+
+# Notebooks output (commit notebooks, not outputs)
+notebooks/.ipynb_checkpoints/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+
+# Poetry
+poetry.lock

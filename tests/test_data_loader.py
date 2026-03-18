@@ -10,10 +10,6 @@ import pytest
 from ml_trading_system.data.data_loader import DataLoader
 
 
-def test_sanity():
-    assert 1 + 1 == 2
-
-
 def test_data_loader_init(tmp_path: Path):
     loader = DataLoader(data_dir=tmp_path)
     assert loader.data_dir.exists()

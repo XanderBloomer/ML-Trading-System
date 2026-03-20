@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -83,12 +84,47 @@ class TrainedModel:
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """
         Predict class labels (0 = down, 1 = up).
-
         Uses predict_proba with threshold=0.5.
-        The threshold can be tuned later for precision/recall tradeoff.
         """
+        return self.predict_with_threshold(X, threshold=0.5)
+
+    def predict_with_threshold(
+        self,
+        X: pd.DataFrame,
+        threshold: float = 0.5,
+    ) -> np.ndarray:
+        """
+        Predict class labels using a custom probability threshold.
+
+        WHY THIS EXISTS:
+            Default predict() uses 0.5 — trade whenever P(up) > 50%.
+            But a 51% confident signal is barely better than a coin flip.
+            By raising the threshold to e.g. 0.6, we only trade when
+            the model is genuinely confident. This means:
+              - Fewer trades (less commission drag)
+              - Higher quality trades (higher precision)
+              - More days in cash (missing some gains, avoiding some losses)
+
+            The trade-off: higher threshold = fewer signals = smaller
+            sample size for the backtest. Too high and you barely trade.
+            0.55 and 0.60 are sensible values to test first.
+
+        Args:
+            X:         Feature matrix.
+            threshold: Minimum P(up) required to generate a buy signal.
+                       Must be between 0.5 and 1.0.
+                       Below 0.5 would invert the model's logic.
+
+        Returns:
+            Array of 0s and 1s. 1 = P(up) >= threshold, 0 = hold cash.
+        """
+        if not 0.5 <= threshold <= 1.0:
+            raise ValueError(
+                f"Threshold must be between 0.5 and 1.0, got {threshold}. "
+                f"Values below 0.5 would invert the model's direction."
+            )
         proba = self.predict_proba(X)
-        return (proba[:, 1] >= 0.5).astype(int)
+        return (proba[:, 1] >= threshold).astype(int)
 
 
 class ModelTrainer:
@@ -170,51 +206,26 @@ class ModelTrainer:
 
     def _train_xgboost(self, split: SplitResult) -> TrainedModel:
         """
-        Train an XGBoost gradient boosted tree classifier.
+        Train an XGBoost classifier with isotonic probability calibration.
 
-        WHY XGBoost:
-            Decision trees can capture non-linear relationships that
-            Logistic Regression cannot. For example:
-            "RSI > 70 AND volatility is low → likely reversal"
-            This kind of interaction is invisible to logistic regression.
+        WHY CalibratedClassifierCV:
+            XGBoost optimises for ranking not probability accuracy.
+            Raw probabilities are unreliable — 0.6 confidence may only
+            be right 52% of the time. Isotonic calibration fits a
+            non-parametric correction layer on top using 5-fold CV
+            on training data only. After calibration, P(up)=0.6 means
+            the market went up ~60% of the time at that confidence level.
 
-        WHY NO SCALER:
-            XGBoost splits on feature values (e.g. "if RSI > 65").
-            The actual scale doesn't matter — only the ordering does.
-            Adding a scaler would change nothing.
-
-        HYPERPARAMETER DECISIONS:
-            n_estimators=300:   Number of trees. Too few = underfitting.
-                                Too many = overfitting. 300 is a safe start.
-            max_depth=4:        Maximum tree depth. Shallow trees (3-5)
-                                generalise better on financial data which
-                                is mostly noise. Deep trees memorise noise.
-            learning_rate=0.05: How much each tree corrects the previous.
-                                Lower = more trees needed but better
-                                generalisation. 0.05 is conservative.
-            subsample=0.8:      Each tree sees 80% of training rows
-                                (random). Reduces overfitting.
-            colsample_bytree=0.8: Each tree sees 80% of features.
-                                  Reduces overfitting further.
-            eval_metric="logloss": We care about predicted probabilities,
-                                   not just class labels. Log loss
-                                   measures probability calibration.
-            random_state=42:    Reproducibility.
-
-        NOTE: These are starting hyperparameters. We will tune them
-        properly using walk-forward cross-validation in a later phase.
+        WHY method="isotonic" not "sigmoid":
+            Sigmoid assumes symmetric monotonic miscalibration.
+            Isotonic is non-parametric — no shape assumptions.
+            Financial data is rarely symmetric so isotonic is safer.
         """
-        # --- Decision: compute scale_pos_weight ---
-        # XGBoost's equivalent of class_weight="balanced".
-        # scale_pos_weight = count(negative class) / count(positive class)
-        # If 530 up days and 470 down days:
-        #   scale_pos_weight = 470 / 530 = 0.887
-        # This tells XGBoost to weight the minority class higher.
         n_down = (split.y_train == 0).sum()
         n_up = (split.y_train == 1).sum()
         scale_pos_weight = n_down / n_up if n_up > 0 else 1.0
 
-        model = XGBClassifier(
+        base_model = XGBClassifier(
             n_estimators=300,
             max_depth=4,
             learning_rate=0.05,
@@ -223,21 +234,27 @@ class ModelTrainer:
             scale_pos_weight=scale_pos_weight,
             eval_metric="logloss",
             random_state=42,
-            verbosity=0,  # suppress XGBoost's own output
+            verbosity=0,
+        )
+
+        # Wrap in calibration layer — cv=5 uses training data only
+        model = CalibratedClassifierCV(
+            base_model,
+            method="isotonic",
+            cv=5,
         )
 
         model.fit(split.X_train, split.y_train)
 
-        # --- Store feature importances in metadata ---
-        # XGBoost gives us feature importances for free.
-        # We store them now so the evaluator can display them
-        # without needing access to the raw model internals.
-        importances = dict(
-            zip(
-                split.X_train.columns,
-                model.feature_importances_,
-            )
+        # Average feature importances across the 5 calibrated folds
+        importances_per_fold = np.array(
+            [
+                est.estimator.feature_importances_
+                for est in model.calibrated_classifiers_
+            ]
         )
+        mean_importances = importances_per_fold.mean(axis=0)
+        importances = dict(zip(split.X_train.columns, mean_importances))
 
         return TrainedModel(
             name="xgboost",
